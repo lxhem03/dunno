@@ -1,69 +1,82 @@
-import asyncio
 import os
-import libtorrent as lt
+import torrent_file
 from pyrogram import Client, filters
+from pyrogram.types import Message
+import hashlib
 
-API_ID = 27394279   # <-- your API ID here
-API_HASH = "90a9aa4c31afa3750da5fd686c410851"
-BOT_TOKEN = "7567477886:AAEMI6V1ImkbEkwUIkMfHNfVrQFFB4GKNtI"
+# Replace with your own API ID, API Hash, and Bot Token
+api_id = "27394279"
+api_hash = "90a9aa4c31afa3750da5fd686c410851"
+bot_token = "7567477886:AAEMI6V1ImkbEkwUIkMfHNfVrQFFB4GKNtI"
 
-DOWNLOADS_DIR = "downloads"
-TORRENTS_DIR = "torrents"
+# Initialize the Pyrogram client
+app = Client("torrent_bot", api_id=api_id, api_hash=api_hash, bot_token=bot_token)
 
-os.makedirs(DOWNLOADS_DIR, exist_ok=True)
-os.makedirs(TORRENTS_DIR, exist_ok=True)
+# Public trackers for the torrent
+TRACKERS = [
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://tracker.leechers-paradise.org:6969/announce",
+    "udp://open.stealth.si:80/announce",
+]
 
-app = Client("torrent_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# Function to create a torrent file and magnet link
+def create_torrent(file_path, output_dir):
+    try:
+        # Create torrent using torrent-file
+        torrent = torrent_file.Torrent()
+        torrent.add_file(file_path)
+        torrent.set_trackers(TRACKERS)
+        torrent.set_creator("TorrentBot")
+        
+        # Generate torrent file
+        torrent_file = os.path.join(output_dir, f"{os.path.basename(file_path)}.torrent")
+        torrent.generate()
+        with open(torrent_file, "wb") as f:
+            f.write(torrent.to_bytes())
+        
+        # Generate magnet link
+        with open(file_path, "rb") as f:
+            file_hash = hashlib.sha1(f.read()).hexdigest()
+        magnet = f"magnet:?xt=urn:btih:{file_hash}&dn={os.path.basename(file_path)}&tr={'&tr='.join(TRACKERS)}"
+        
+        return torrent_file, magnet
+    except Exception as e:
+        raise Exception(f"Failed to create torrent: {str(e)}")
 
-def create_torrent(file_path):
-    fs = lt.file_storage()
-    lt.add_files(fs, file_path)
-    t = lt.create_torrent(fs)
-    t.add_tracker("udp://tracker.openbittorrent.com:80/announce")
-    t.set_creator("Pyrogram Torrent Bot")
-    lt.set_piece_hashes(t, os.path.dirname(file_path))
-    torrent = t.generate()
-    torrent_path = os.path.join(TORRENTS_DIR, os.path.basename(file_path) + ".torrent")
-    with open(torrent_path, "wb") as f:
-        f.write(lt.bencode(torrent))
-    # Generate magnet URI
-    info = lt.torrent_info(torrent_path)
-    magnet_uri = lt.make_magnet_uri(info)
-    return torrent_path, magnet_uri
+# Handle the /start command
+@app.on_message(filters.command("start"))
+async def start(client: Client, message: Message):
+    await message.reply_text("Send me a file, and I'll create a torrent and magnet link for it!")
 
-async def seed_torrent(torrent_path, file_path):
-    ses = lt.session()
-    ses.listen_on(6881, 6891)
-    params = {
-        "save_path": os.path.dirname(file_path),
-        "storage_mode": lt.storage_mode_t.storage_mode_sparse,
-    }
-    info = lt.torrent_info(torrent_path)
-    h = ses.add_torrent({'ti': info, 'save_path': params["save_path"]})
-    print("Seeding started for:", file_path)
-    # To keep seeding, you may want to run this in a background process/thread
-    # For now, just seed for 5 minutes
-    for i in range(300):
-        await asyncio.sleep(1)
-    print("Seeding finished for:", file_path)
+# Handle file uploads
+@app.on_message(filters.document | filters.photo | filters.video | filters.audio)
+async def handle_file(client: Client, message: Message):
+    try:
+        # Download the file
+        file = await message.download()
+        await message.reply_text("File received! Creating torrent...")
 
-@app.on_message(filters.document | filters.video | filters.audio)
-async def handle_file(client, message):
-    # Download file
-    sent = await message.reply_text("Downloading your file...")
-    downloaded = await message.download(DOWNLOADS_DIR)
-    await sent.edit("Creating torrent file...")
-    torrent_path, magnet_uri = create_torrent(downloaded)
-    await sent.edit("Seeding the torrent (for 5 minutes)...")
-    asyncio.create_task(seed_torrent(torrent_path, downloaded))
-    await sent.edit(
-        f"✅ Torrent created!\n\n"
-        f"**Magnet link:**\n`{magnet_uri}`\n\n"
-        f"**Torrent file:**",
-        disable_web_page_preview=True,
-    )
-    await message.reply_document(torrent_path, caption="Here is your .torrent file!")
+        # Create a directory for torrents if it doesn't exist
+        output_dir = "torrents"
+        os.makedirs(output_dir, exist_ok=True)
 
+        # Create torrent and magnet link
+        torrent_file, magnet_link = create_torrent(file, output_dir)
+
+        # Send the torrent file
+        await message.reply_document(
+            document=torrent_file,
+            caption=f"Here’s your torrent file!\n\nMagnet Link: `{magnet_link}`"
+        )
+
+        # Clean up the downloaded file and torrent file
+        os.remove(file)
+        os.remove(torrent_file)
+
+    except Exception as e:
+        await message.reply_text(f"Error: {str(e)}")
+
+# Run the bot
 if __name__ == "__main__":
     print("Bot is running...")
     app.run()
