@@ -5,7 +5,7 @@ from pyrogram import Client, filters
 
 API_ID = 27394279   # <-- your API ID here
 API_HASH = "90a9aa4c31afa3750da5fd686c410851"
-BOT_TOKEN = "your_bot_token_here"
+BOT_TOKEN = "7567477886:AAEMI6V1ImkbEkwUIkMfHNfVrQFFB4GKNtI"
 
 DOWNLOADS_DIR = "downloads"
 TORRENTS_DIR = "torrents"
