@@ -1,18 +1,18 @@
+# Use a lightweight Python base image
 FROM python:3.10-slim
 
-# Install system dependencies for libtorrent
-RUN apt-get update && \
-    apt-get install -y python3-libtorrent && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
-
-# Set work directory
+# Set working directory
 WORKDIR /app
 
-# Copy your main.py into the container
-COPY main.py .
+# Copy requirements.txt
+COPY requirements.txt .
 
-# Install Python dependencies
-RUN pip install pyrogram tgcrypto
+# Install dependencies
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Run your bot
-CMD gunicorn app:app  & python main.py
+# Copy the bot script
+COPY bot.py .
+
+
+# Command to run the bot
+CMD gunicorn app:app & python bot.py
