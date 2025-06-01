@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 DOWNLOADS_DIR = "downloads"
 TORRENTS_DIR = "torrents"
-BATCHES = {}  # Stores user_id: [file_paths]
+BATCHES = {}  # Stores user_id: [Message objects]
 USER_TASKS = {}  # Stores user_id: {'type': 'download', 'cancel': Event}
 
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
@@ -65,6 +65,16 @@ def time_format(seconds):
     except Exception as e:
         logger.error(f"Error in time_format: {e}")
         return "Unknown time"
+
+async def delete_file_later(file_path, delay=300):
+    """Delete a file after a specified delay (default 5 minutes)."""
+    try:
+        await asyncio.sleep(delay)
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            logger.info(f"Deleted file after {delay} seconds: {file_path}")
+    except Exception as e:
+        logger.error(f"Error deleting file {file_path}: {e}")
 
 # --- Download Progress ---
 async def download_with_progress(message, pyrogram_file, dest, is_batch=False, batch_total=1, batch_index=1, user_id=None):
@@ -140,7 +150,7 @@ async def download_with_progress(message, pyrogram_file, dest, is_batch=False, b
                     ]))
                 except Exception:
                     pass
-                await asyncio.sleep(10)
+                await asyncio.sleep(5)  # Changed to 5 seconds
             # Final update
             bar = progress_bar(progress)
             if is_batch:
@@ -182,6 +192,8 @@ async def download_with_progress(message, pyrogram_file, dest, is_batch=False, b
         await sent.edit_text("✅ Download complete!")
         logger.info(f"Download completed for {dest}")
         del USER_TASKS[user_id]
+        # Schedule file deletion after 5 minutes
+        asyncio.create_task(delete_file_later(dest, delay=300))
         return dest
     except Exception as e:
         cancel_event.set()
@@ -211,6 +223,8 @@ def create_torrent(file_path, torrent_name=None):
         info = lt.torrent_info(torrent_path)
         magnet_uri = lt.make_magnet_uri(info)
         logger.info(f"Torrent created: {torrent_path}, Magnet: {magnet_uri}")
+        # Schedule torrent file deletion after 5 minutes
+        asyncio.create_task(delete_file_later(torrent_path, delay=300))
         return torrent_path, magnet_uri
     except Exception as e:
         logger.error(f"Error creating torrent for {file_path}: {e}")
@@ -228,7 +242,7 @@ async def seed_torrent(torrent_path, file_path):
         info = lt.torrent_info(torrent_path)
         h = ses.add_torrent({'ti': info, 'save_path': params["save_path"]})
         logger.info(f"Seeding started for: {file_path}")
-        for i in range(300):
+        for i in range(300):  # Seed for 5 minutes
             await asyncio.sleep(1)
         logger.info(f"Seeding finished for: {file_path}")
     except Exception as e:
@@ -269,12 +283,8 @@ async def cancel_cmd(client, message: Message):
             del USER_TASKS[user_id]
             await message.reply_text("❌ Your current process has been cancelled.")
         elif user_id in BATCHES:
-            for file_path in BATCHES[user_id]:
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-                    logger.info(f"Removed batch file: {file_path}")
             del BATCHES[user_id]
-            await message.reply_text("❌ Your current batch has been cancelled.")
+            await message.reply_text("❌ Your current batch queue has been cancelled.")
         else:
             await message.reply_text("You have no ongoing tasks.")
     except Exception as e:
@@ -290,14 +300,10 @@ async def cancel_download_cb(client, callback_query):
             del USER_TASKS[user_id]
             await callback_query.edit_message_text("❌ Download cancelled by user.")
         elif user_id in BATCHES:
-            for file_path in BATCHES[user_id]:
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-                    logger.info(f"Removed batch file: {file_path}")
             del BATCHES[user_id]
-            await callback_query.edit_message_text("❌ Batch cancelled by user.")
+            await callback_query.edit_message_text("❌ Batch queue cancelled by user.")
         else:
-            await callback_query.answer("No active download to cancel.", show_alert=True)
+            await callback_query.answer("No active download or batch to cancel.", show_alert=True)
     except Exception as e:
         logger.error(f"Error in cancel_download_cb for user {user_id}: {e}")
 
@@ -306,7 +312,7 @@ async def cancel_download_cb(client, callback_query):
 async def save_file(client, message: Message):
     user_id = message.from_user.id
     logger.info(f"File received from user {user_id}")
-    # Only process files if user is in batch mode
+    # Only queue files if user is in batch mode
     if user_id not in BATCHES:
         try:
             await message.reply_text("Please start batch mode with /batch before sending files, or reply to this file with /create to generate a torrent.", parse_mode=enums.ParseMode.HTML)
@@ -316,29 +322,15 @@ async def save_file(client, message: Message):
             logger.error(f"Error replying to user {user_id} in save_file: {e}")
             return
 
-    # Handle batch file
+    # Queue the file (store Message object)
     try:
-        file_name = message.document.file_name if message.document else message.video.file_name if message.video else message.audio.file_name
-        dest = os.path.join(DOWNLOADS_DIR, file_name or f"file_{user_id}_{int(time.time())}")
         batch_list = BATCHES[user_id]
-        logger.info(f"Downloading batch file for user {user_id}: {dest}")
-        downloaded = await download_with_progress(
-            message,
-            message,
-            dest,
-            is_batch=True,
-            batch_total=len(batch_list) + 1,
-            batch_index=len(batch_list) + 1,
-            user_id=user_id
-        )
-        if downloaded:
-            batch_list.append(downloaded)
-            await message.reply_text(f"Added to batch: <b>{os.path.basename(downloaded)}</b>", parse_mode=enums.ParseMode.HTML)
-            logger.info(f"File {dest} added to batch for user {user_id}")
-        else:
-            logger.warning(f"Failed to download batch file {dest} for user {user_id}")
+        batch_list.append(message)
+        queue_position = len(batch_list)
+        await message.reply_text(f"File added to queue {queue_position} of batch", parse_mode=enums.ParseMode.HTML)
+        logger.info(f"File queued for user {user_id}, position: {queue_position}")
     except Exception as e:
-        logger.error(f"Error processing batch file for user {user_id}: {e}")
+        logger.error(f"Error queuing file for user {user_id}: {e}")
 
 # --- Create Torrent on Reply ---
 @app.on_message(filters.command("create") & filters.reply)
@@ -429,20 +421,60 @@ async def batch_done(client, message: Message):
         folder_path = os.path.join(DOWNLOADS_DIR, batch_name)
         os.makedirs(folder_path, exist_ok=True)
 
-        # Move files to the batch folder
-        for f in BATCHES[user_id]:
-            if os.path.exists(f):
-                os.rename(f, os.path.join(folder_path, os.path.basename(f)))
-                logger.info(f"Moved file to batch folder: {f} -> {folder_path}")
-            else:
-                logger.warning(f"Batch file not found: {f}")
+        batch_list = BATCHES[user_id]
+        total_files = len(batch_list)
+        completed_files = 0
+        downloaded_paths = []
 
-        sent = await message.reply_text(f"Creating batch torrent: <b>{batch_name}</b>...", parse_mode=enums.ParseMode.HTML)
+        # Download all queued files
+        sent = await message.reply_text(f"Downloading {total_files} files for batch: <b>{batch_name}</b>...", parse_mode=enums.ParseMode.HTML)
+        for index, file_message in enumerate(batch_list, 1):
+            if USER_TASKS.get(user_id, {}).get('cancel', asyncio.Event()).is_set():
+                await sent.edit_text("❌ Batch download cancelled.")
+                logger.info(f"Batch download cancelled for user {user_id}")
+                break
+
+            file_name = file_message.document.file_name if file_message.document else file_message.video.file_name if file_message.video else file_message.audio.file_name
+            dest = os.path.join(folder_path, file_name or f"file_{user_id}_{int(time.time())}_{index}")
+            logger.info(f"Downloading batch file {index}/{total_files} for user {user_id}: {dest}")
+            downloaded = await download_with_progress(
+                message,
+                file_message,
+                dest,
+                is_batch=True,
+                batch_total=total_files,
+                batch_index=index,
+                user_id=user_id
+            )
+            if downloaded:
+                completed_files += 1
+                downloaded_paths.append(downloaded)
+                try:
+                    await sent.edit_text(
+                        f"Downloading files for batch: <b>{batch_name}</b>\n\n"
+                        f"🔗 Files: {completed_files}/{total_files}",
+                        parse_mode=enums.ParseMode.HTML
+                    )
+                except Exception:
+                    pass
+            else:
+                logger.warning(f"Failed to download batch file {dest} for user {user_id}")
+
+        if completed_files == 0:
+            await sent.edit_text("❌ No files were downloaded for the batch.")
+            logger.warning(f"No files downloaded for batch {batch_name} for user {user_id}")
+            del BATCHES[user_id]
+            return
+
+        # Create torrent for downloaded files
+        await sent.edit_text(f"Creating batch torrent: <b>{batch_name}</b>...", parse_mode=enums.ParseMode.HTML)
         torrent_path, magnet_uri = create_torrent(folder_path, torrent_name=batch_name)
         if not torrent_path or not magnet_uri:
             await sent.edit_text("Failed to create batch torrent.")
             logger.error(f"Failed to create batch torrent for {folder_path}")
+            del BATCHES[user_id]
             return
+
         await sent.edit(f"<b>Batch torrent created!</b>\n\n<code>{magnet_uri}</code>\n\nSending .torrent file...", parse_mode=enums.ParseMode.HTML)
         await message.reply_document(torrent_path, caption="Batch .torrent file")
         logger.info(f"Batch torrent sent to user {user_id}: {torrent_path}")
