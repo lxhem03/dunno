@@ -10,8 +10,8 @@ from config import API_ID, API_HASH, BOT_TOKEN
 
 DOWNLOADS_DIR = "downloads"
 TORRENTS_DIR = "torrents"
-BATCHES = {}
-USER_TASKS = {}
+BATCHES = {}  # Stores user_id: [file_paths]
+USER_TASKS = {}  # Stores user_id: {'type': 'download', 'cancel': Event}
 
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 os.makedirs(TORRENTS_DIR, exist_ok=True)
@@ -20,7 +20,6 @@ app = Client("torrent_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKE
 
 # --- Utility Functions ---
 def human_readable_size(size):
-    # Return size as e.g. 10.2 MB
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
         if size < 1024:
             return f"{size:.2f} {unit}"
@@ -46,7 +45,6 @@ def time_format(seconds):
 # --- Download Progress ---
 async def download_with_progress(message, pyrogram_file, dest, is_batch=False, batch_total=1, batch_index=1, user_id=None):
     start_time = time.time()
-    last_update = start_time
     cancel_event = asyncio.Event()
     USER_TASKS[user_id] = {'type': 'download', 'cancel': cancel_event}
 
@@ -80,14 +78,14 @@ async def download_with_progress(message, pyrogram_file, dest, is_batch=False, b
             if is_batch:
                 text = (f"🚀 Downloading...  ⚡\n\n"
                         f"{bar}\n\n"
-                        f"🔗 Files : {batch_index} | {batch_total}\n"
+                        f"🔗 Files : {batch_index}/{batch_total}\n"
                         f"️ ⏳️ Done : {percentage:.2f}%\n"
                         f"🚀 Speed : {human_readable_size(speed)}/s\n"
                         f"️ ⏰️ ETA : {time_format(eta)}")
             else:
                 text = (f"🚀 Downloading...  ⚡\n\n"
                         f"{bar}\n\n"
-                        f"🔗 Size : {human_readable_size(downloaded)} | {human_readable_size(total_size)}\n"
+                        f"🔗 Size : {human_readable_size(downloaded)}/{human_readable_size(total_size)}\n"
                         f"️ ⏳️ Done : {percentage:.2f}%\n"
                         f"🚀 Speed : {human_readable_size(speed)}/s\n"
                         f"️ ⏰️ ETA : {time_format(eta)}")
@@ -103,14 +101,14 @@ async def download_with_progress(message, pyrogram_file, dest, is_batch=False, b
         if is_batch:
             text = (f"🚀 Downloading...  ⚡\n\n"
                     f"{bar}\n\n"
-                    f"🔗 Files : {batch_index} | {batch_total}\n"
+                    f"🔗 Files : {batch_index}/{batch_total}\n"
                     f"️ ⏳️ Done : {percentage:.2f}%\n"
                     f"🚀 Speed : {human_readable_size(speed)}/s\n"
                     f"️ ⏰️ ETA : {time_format(eta)}")
         else:
             text = (f"🚀 Downloading...  ⚡\n\n"
                     f"{bar}\n\n"
-                    f"🔗 Size : {human_readable_size(downloaded)} | {human_readable_size(total_size)}\n"
+                    f"🔗 Size : {human_readable_size(downloaded)}/{human_readable_size(total_size)}\n"
                     f"️ ⏳️ Done : {percentage:.2f}%\n"
                     f"🚀 Speed : {human_readable_size(speed)}/s\n"
                     f"️ ⏰️ ETA : {time_format(eta)}")
@@ -198,6 +196,9 @@ async def cancel_cmd(client, message: Message):
         del USER_TASKS[user_id]
         await message.reply_text("❌ Your current process has been cancelled.")
     elif user_id in BATCHES:
+        for file_path in BATCHES[user_id]:
+            if os.path.exists(file_path):
+                os.remove(file_path)
         del BATCHES[user_id]
         await message.reply_text("❌ Your current batch has been cancelled.")
     else:
@@ -211,29 +212,39 @@ async def cancel_download_cb(client, callback_query):
         del USER_TASKS[user_id]
         await callback_query.edit_message_text("❌ Download cancelled by user.")
     elif user_id in BATCHES:
+        for file_path in BATCHES[user_id]:
+            if os.path.exists(file_path):
+                os.remove(file_path)
         del BATCHES[user_id]
         await callback_query.edit_message_text("❌ Batch cancelled by user.")
     else:
         await callback_query.answer("No active download to cancel.", show_alert=True)
 
 # --- File Handling ---
-@app.on_message((filters.document | filters.video | filters.audio) & ~filters.command(["batch"]))
+@app.on_message(filters.document | filters.video | filters.audio)
 async def save_file(client, message: Message):
     user_id = message.from_user.id
-    if user_id in BATCHES:
-        # Handle batch
-        batch_list = BATCHES[user_id]
-        dest = os.path.join(DOWNLOADS_DIR, message.file_name or f"file_{int(time.time())}")
-        downloaded = await download_with_progress(message, message, dest, is_batch=True, batch_total=0, batch_index=len(batch_list)+1, user_id=user_id)
-        if downloaded:
-            batch_list.append(downloaded)
-            await message.reply_text(f"Added to batch: <b>{os.path.basename(downloaded)}</b>", parse_mode=enums.ParseMode.HTML)
-    else:
-        # Single file
-        dest = os.path.join(DOWNLOADS_DIR, message.file_name or f"file_{int(time.time())}")
-        downloaded = await download_with_progress(message, message, dest, is_batch=False, user_id=user_id)
-        if downloaded:
-            await message.reply_text(f"File saved! Now reply to this file with <b>/create</b> to generate torrent/magnet.", parse_mode=enums.ParseMode.HTML)
+    # Only process files if user is in batch mode
+    if user_id not in BATCHES:
+        await message.reply_text("Please start batch mode with /batch before sending files, or reply to this file with /create to generate a torrent.", parse_mode=enums.ParseMode.HTML)
+        return
+
+    # Handle batch file
+    file_name = message.document.file_name if message.document else message.video.file_name if message.video else message.audio.file_name
+    dest = os.path.join(DOWNLOADS_DIR, file_name or f"file_{user_id}_{int(time.time())}")
+    batch_list = BATCHES[user_id]
+    downloaded = await download_with_progress(
+        message,
+        message,
+        dest,
+        is_batch=True,
+        batch_total=len(batch_list) + 1,
+        batch_index=len(batch_list) + 1,
+        user_id=user_id
+    )
+    if downloaded:
+        batch_list.append(downloaded)
+        await message.reply_text(f"Added to batch: <b>{os.path.basename(downloaded)}</b>", parse_mode=enums.ParseMode.HTML)
 
 # --- Create Torrent on Reply ---
 @app.on_message(filters.command("create") & filters.reply)
@@ -241,11 +252,22 @@ async def create_torrent_cmd(client, message: Message):
     reply = message.reply_to_message
     if not (reply and (reply.document or reply.video or reply.audio)):
         return await message.reply_text("Please reply to a file message with /create.", parse_mode=enums.ParseMode.HTML)
+
+    user_id = message.from_user.id
     file_name = reply.document.file_name if reply.document else reply.video.file_name if reply.video else reply.audio.file_name
-    file_path = os.path.join(DOWNLOADS_DIR, file_name)
+    file_path = os.path.join(DOWNLOADS_DIR, file_name or f"file_{user_id}_{int(time.time())}")
+
+    # Download the replied-to file if not already downloaded
     if not os.path.exists(file_path):
-        return await message.reply_text("File not found. Please resend the file.", parse_mode=enums.ParseMode.HTML)
-    sent = await message.reply_text("Creating torrent...")
+        sent = await message.reply_text("Downloading file to create torrent...")
+        downloaded = await download_with_progress(reply, reply, file_path, is_batch=False, user_id=user_id)
+        if not downloaded:
+            await sent.edit_text("Failed to download the file.")
+            return
+        await sent.edit_text("File downloaded! Creating torrent...")
+    else:
+        sent = await message.reply_text("Creating torrent...")
+
     torrent_path, magnet_uri = create_torrent(file_path, torrent_name=os.path.splitext(file_name)[0])
     await sent.edit(f"<b>Torrent created!</b>\n\n<code>{magnet_uri}</code>\n\nSending .torrent file...", parse_mode=enums.ParseMode.HTML)
     await message.reply_document(torrent_path, caption=".torrent file")
@@ -255,23 +277,30 @@ async def create_torrent_cmd(client, message: Message):
 @app.on_message(filters.command("batch"))
 async def batch_start(client, message: Message):
     user_id = message.from_user.id
+    if user_id in BATCHES:
+        await message.reply_text("You are already in batch mode. Send files or use /done <batch_name> to finish.", parse_mode=enums.ParseMode.HTML)
+        return
     BATCHES[user_id] = []
-    await message.reply_text("Batch mode started! Send me files one by one. When done, send /done &lt;batch_name&gt; to generate a torrent.", parse_mode=enums.ParseMode.HTML)
+    await message.reply_text("Batch mode started! Send me files one by one. When done, send /done <batch_name> to generate a torrent.", parse_mode=enums.ParseMode.HTML)
 
 @app.on_message(filters.command("done"))
 async def batch_done(client, message: Message):
     user_id = message.from_user.id
     if user_id not in BATCHES or not BATCHES[user_id]:
         return await message.reply_text("No files in your batch. Use /batch to start.", parse_mode=enums.ParseMode.HTML)
+
     try:
         batch_name = message.text.split(None, 1)[1].strip()
-    except Exception:
-        batch_name = f"batch_{user_id}"
+    except IndexError:
+        batch_name = f"batch_{user_id}_{int(time.time())}"
+
     folder_path = os.path.join(DOWNLOADS_DIR, batch_name)
     os.makedirs(folder_path, exist_ok=True)
+
     # Move files to the batch folder
     for f in BATCHES[user_id]:
         os.rename(f, os.path.join(folder_path, os.path.basename(f)))
+
     sent = await message.reply_text(f"Creating batch torrent: <b>{batch_name}</b>...", parse_mode=enums.ParseMode.HTML)
     torrent_path, magnet_uri = create_torrent(folder_path, torrent_name=batch_name)
     await sent.edit(f"<b>Batch torrent created!</b>\n\n<code>{magnet_uri}</code>\n\nSending .torrent file...", parse_mode=enums.ParseMode.HTML)
