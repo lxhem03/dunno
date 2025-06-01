@@ -2,9 +2,13 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-COPY main.py .
+COPY requirements.txt .
 
-# Install Python dependencies, including libtorrent via pip
-RUN pip install pyrogram tgcrypto "libtorrent>=2.0.7"
+RUN pip install --no-cache-dir -r requirements.txt
 
-CMD ["python", "main.py"]
+COPY bot.py .
+
+COPY script.py .
+
+
+CMD ["python", "bot.py"]
