@@ -217,7 +217,7 @@ async def cancel_download_cb(client, callback_query):
         await callback_query.answer("No active download to cancel.", show_alert=True)
 
 # --- File Handling ---
-@app.on_message((filters.document | filters.video | filters.audio) & ~filters.edited & ~filters.command(["batch"]))
+@app.on_message((filters.document | filters.video | filters.audio) & ~filters.command(["batch"]))
 async def save_file(client, message: Message):
     user_id = message.from_user.id
     if user_id in BATCHES:
