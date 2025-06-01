@@ -1,18 +1,10 @@
-# Use a lightweight Python base image
 FROM python:3.10-slim
 
-# Set working directory
 WORKDIR /app
 
-# Copy requirements.txt
-COPY requirements.txt .
+COPY main.py .
 
-# Install dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Install Python dependencies, including libtorrent via pip
+RUN pip install pyrogram tgcrypto "libtorrent>=2.0.7"
 
-# Copy the bot script
-COPY bot.py .
-
-
-# Command to run the bot
-CMD gunicorn app:app & python bot.py
+CMD ["python", "main.py"]
