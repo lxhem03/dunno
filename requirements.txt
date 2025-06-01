@@ -1,6 +1,6 @@
 pyrogram
+libtorrent>=2.0.7
 tgcrypto
-torrent-file==0.1.1
 Flask
 gunicorn
 Jinja2
