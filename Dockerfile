@@ -10,5 +10,6 @@ COPY main.py .
 
 COPY script.py .
 
+COPY config.py .
 
 CMD ["python", "main.py"]
