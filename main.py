@@ -6,6 +6,7 @@ import logging
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 import libtorrent as lt
+import mimetypes
 from script import START_TEXT, HELP_TEXT, ABOUT_TEXT
 from config import API_ID, API_HASH, BOT_TOKEN
 
@@ -23,7 +24,7 @@ logger = logging.getLogger(__name__)
 DOWNLOADS_DIR = "downloads"
 TORRENTS_DIR = "torrents"
 BATCHES = {}  # Stores user_id: [Message objects]
-USER_TASKS = {}  # Stores user_id: {'type': 'download', 'cancel': Event}
+USER_TASKS = {}  # Stores user_id: {'type': 'download' or 'upload', 'cancel': Event}
 
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 os.makedirs(TORRENTS_DIR, exist_ok=True)
@@ -75,6 +76,15 @@ async def delete_file_later(file_path, delay=300):
             logger.info(f"Deleted file after {delay} seconds: {file_path}")
     except Exception as e:
         logger.error(f"Error deleting file {file_path}: {e}")
+
+def get_file_duration(file_path):
+    """Get duration for video files (dummy implementation; replace with ffmpeg or similar)."""
+    try:
+        # Placeholder: Use ffmpeg-python or similar to get actual duration
+        return 0  # Return 0 for non-video files or if duration cannot be determined
+    except Exception as e:
+        logger.error(f"Error getting duration for {file_path}: {e}")
+        return 0
 
 # --- Download Progress ---
 async def download_with_progress(message, pyrogram_file, dest, is_batch=False, batch_total=1, batch_index=1, user_id=None):
@@ -150,27 +160,7 @@ async def download_with_progress(message, pyrogram_file, dest, is_batch=False, b
                     ]))
                 except Exception:
                     pass
-                await asyncio.sleep(5)  # Changed to 5 seconds
-            # Final update
-            bar = progress_bar(progress)
-            if is_batch:
-                text = (f"🚀 Downloading...  ⚡\n\n"
-                        f"{bar}\n\n"
-                        f"🔗 Files: {batch_index}/{batch_total}\n"
-                        f"⏳ Done: {percentage:.2f}%\n"
-                        f"🚀 Speed: {human_readable_size(speed)}/s\n"
-                        f"⏰ ETA: {time_format(eta)}")
-            else:
-                text = (f"🚀 Downloading...  ⚡\n\n"
-                        f"{bar}\n\n"
-                        f"🔗 Size: {human_readable_size(downloaded)}/{human_readable_size(total_size)}\n"
-                        f"⏳ Done: {percentage:.2f}%\n"
-                        f"🚀 Speed: {human_readable_size(speed)}/s\n"
-                        f"⏰ ETA: {time_format(eta)}")
-            try:
-                await sent.edit_text(text)
-            except Exception:
-                pass
+                await asyncio.sleep(5)  # Update every 5 seconds
         except Exception as e:
             logger.error(f"Error in progress_loop for {dest}: {e}")
 
@@ -188,21 +178,134 @@ async def download_with_progress(message, pyrogram_file, dest, is_batch=False, b
             progress_args=()
         )
         cancel_event.set()
-        await asyncio.sleep(1)
-        await sent.edit_text("✅ Download complete!")
+        await progress_task
+        try:
+            await sent.edit_text("✅ Download complete!")
+            await asyncio.sleep(2)  # Show completion for 2 seconds
+            await sent.delete()  # Delete progress bar
+        except Exception as e:
+            logger.error(f"Error updating/deleting progress message for {dest}: {e}")
         logger.info(f"Download completed for {dest}")
         del USER_TASKS[user_id]
-        # Schedule file deletion after 5 minutes
         asyncio.create_task(delete_file_later(dest, delay=300))
         return dest
     except Exception as e:
         cancel_event.set()
-        await sent.edit_text("❌ Download cancelled or failed.")
+        await progress_task
+        try:
+            await sent.edit_text("❌ Download cancelled or failed.")
+            await asyncio.sleep(2)
+            await sent.delete()
+        except Exception:
+            pass
         if os.path.exists(dest):
             os.remove(dest)
         logger.error(f"Download failed for {dest}: {e}")
         del USER_TASKS[user_id]
         return None
+
+# --- Upload Progress ---
+async def upload_with_progress(message, file_path, user_id, is_video=False, duration=0):
+    logger.info(f"Starting upload for user {user_id}, file: {file_path}")
+    start_time = time.time()
+    cancel_event = asyncio.Event()
+    USER_TASKS[user_id] = {'type': 'upload', 'cancel': cancel_event}
+
+    try:
+        sent = await message.reply_text("📤 Uploading...  ⚡", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_upload")]
+        ]))
+    except Exception as e:
+        logger.error(f"Error sending upload message for user {user_id}: {e}")
+        return None
+
+    total_size = os.path.getsize(file_path) if os.path.exists(file_path) else 1
+    uploaded = 0
+    speed = 0
+    eta = 0
+    percentage = 0
+    progress = 0
+    last_uploaded = 0
+    last_time = start_time
+
+    async def update_progress(current, total):
+        nonlocal uploaded, speed, eta, percentage, progress, last_uploaded, last_time
+        try:
+            now = time.time()
+            uploaded = current
+            percentage = (current / total_size) * 100
+            progress = current / total_size
+            speed = (current - last_uploaded) / (now - last_time) if (now - last_time) > 0 else 0
+            eta = (total_size - current) / speed if speed > 0 else 0
+            last_uploaded = current
+            last_time = now
+        except Exception as e:
+            logger.error(f"Error in upload update_progress for {file_path}: {e}")
+
+    async def progress_loop():
+        try:
+            while not cancel_event.is_set() and uploaded < total_size:
+                bar = progress_bar(progress)
+                text = (f"📤 Uploading...  ⚡\n\n"
+                        f"{bar}\n\n"
+                        f"🔗 Size: {human_readable_size(uploaded)}/{human_readable_size(total_size)}\n"
+                        f"⏳ Done: {percentage:.2f}%\n"
+                        f"🚀 Speed: {human_readable_size(speed)}/s\n"
+                        f"⏰ ETA: {time_format(eta)}")
+                try:
+                    await sent.edit_text(text, reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_upload")]
+                    ]))
+                except Exception:
+                    pass
+                await asyncio.sleep(5)
+        except Exception as e:
+            logger.error(f"Error in upload progress_loop for {file_path}: {e}")
+
+    progress_task = asyncio.create_task(progress_loop())
+
+    async def progress_wrapper(current, total):
+        await update_progress(current, total)
+        if cancel_event.is_set():
+            raise Exception("Cancelled")
+
+    try:
+        if is_video:
+            await message.reply_video(
+                video=file_path,
+                duration=duration,
+                progress=progress_wrapper,
+                progress_args=()
+            )
+        else:
+            await message.reply_document(
+                document=file_path,
+                progress=progress_wrapper,
+                progress_args=()
+            )
+        cancel_event.set()
+        await progress_task
+        try:
+            await sent.edit_text("✅ Upload complete!")
+            await asyncio.sleep(2)
+            await sent.delete()
+        except Exception as e:
+            logger.error(f"Error updating/deleting upload progress message for {file_path}: {e}")
+        logger.info(f"Upload completed for {file_path}")
+        del USER_TASKS[user_id]
+        return True
+    except Exception as e:
+        cancel_event.set()
+        await progress_task
+        try:
+            await sent.edit_text("❌ Upload cancelled or failed.")
+            await asyncio.sleep(2)
+            await sent.delete()
+        except Exception:
+            pass
+        logger.error(f"Upload failed for {file_path}: {e}")
+        del USER_TASKS[user_id]
+        return False
 
 # --- Torrent Creation ---
 def create_torrent(file_path, torrent_name=None):
@@ -223,7 +326,6 @@ def create_torrent(file_path, torrent_name=None):
         info = lt.torrent_info(torrent_path)
         magnet_uri = lt.make_magnet_uri(info)
         logger.info(f"Torrent created: {torrent_path}, Magnet: {magnet_uri}")
-        # Schedule torrent file deletion after 5 minutes
         asyncio.create_task(delete_file_later(torrent_path, delay=300))
         return torrent_path, magnet_uri
     except Exception as e:
@@ -247,6 +349,88 @@ async def seed_torrent(torrent_path, file_path):
         logger.info(f"Seeding finished for: {file_path}")
     except Exception as e:
         logger.error(f"Error seeding {torrent_path}: {e}")
+
+# --- Torrent Download (for /seedr) ---
+async def download_torrent(message, torrent_input, user_id):
+    logger.info(f"Starting torrent download for user {user_id}")
+    try:
+        ses = lt.session()
+        ses.listen_on(6881, 6891)
+        params = {
+            "save_path": DOWNLOADS_DIR,
+            "storage_mode": lt.storage_mode_t.storage_mode_sparse,
+        }
+
+        if torrent_input.startswith("magnet:"):
+            h = lt.add_magnet_uri(ses, torrent_input, params)
+        else:
+            info = lt.torrent_info(torrent_input)
+            h = ses.add_torrent({'ti': info, 'save_path': params["save_path"]})
+
+        sent = await message.reply_text("🚀 Downloading torrent...  ⚡", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_download")]
+        ]))
+        USER_TASKS[user_id] = {'type': 'download', 'cancel': asyncio.Event()}
+
+        total_size = h.status().total_wanted
+        downloaded = 0
+        start_time = time.time()
+        last_downloaded = 0
+        last_time = start_time
+
+        while not h.is_seed() and not USER_TASKS[user_id]['cancel'].is_set():
+            s = h.status()
+            downloaded = s.total_wanted_done
+            progress = downloaded / total_size if total_size > 0 else 0
+            percentage = progress * 100
+            speed = (downloaded - last_downloaded) / (time.time() - last_time) if (time.time() - last_time) > 0 else 0
+            eta = (total_size - downloaded) / speed if speed > 0 else 0
+            bar = progress_bar(progress)
+
+            text = (f"🚀 Downloading torrent...  ⚡\n\n"
+                    f"{bar}\n\n"
+                    f"🔗 Size: {human_readable_size(downloaded)}/{human_readable_size(total_size)}\n"
+                    f"⏳ Done: {percentage:.2f}%\n"
+                    f"🚀 Speed: {human_readable_size(speed)}/s\n"
+                    f"⏰ ETA: {time_format(eta)}")
+            try:
+                await sent.edit_text(text, reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Cancel", callback_data="cancel_download")]
+                ]))
+            except Exception:
+                pass
+            last_downloaded = downloaded
+            last_time = time.time()
+            await asyncio.sleep(5)
+
+        if USER_TASKS[user_id]['cancel'].is_set():
+            await sent.edit_text("❌ Torrent download cancelled.")
+            await asyncio.sleep(2)
+            await sent.delete()
+            logger.info(f"Torrent download cancelled for user {user_id}")
+            del USER_TASKS[user_id]
+            return None
+
+        await sent.edit_text("✅ Torrent download complete!")
+        await asyncio.sleep(2)
+        await sent.delete()
+        logger.info(f"Torrent download completed for user {user_id}")
+        del USER_TASKS[user_id]
+
+        # Return downloaded file(s) or directory
+        save_path = os.path.join(DOWNLOADS_DIR, h.name())
+        return save_path if os.path.exists(save_path) else None
+    except Exception as e:
+        logger.error(f"Error downloading torrent for user {user_id}: {e}")
+        try:
+            await sent.edit_text("❌ Torrent download failed.")
+            await asyncio.sleep(2)
+            await sent.delete()
+        except Exception:
+            pass
+        if user_id in USER_TASKS:
+            del USER_TASKS[user_id]
+        return None
 
 # --- Command Handlers ---
 @app.on_message(filters.command("start"))
@@ -290,29 +474,32 @@ async def cancel_cmd(client, message: Message):
     except Exception as e:
         logger.error(f"Error in cancel_cmd for user {user_id}: {e}")
 
-@app.on_callback_query(filters.regex("^cancel_download$"))
-async def cancel_download_cb(client, callback_query):
+@app.on_callback_query(filters.regex("^(cancel_download|cancel_upload)$"))
+async def cancel_callback(client, callback_query):
     user_id = callback_query.from_user.id
-    logger.info(f"Cancel callback received from user {user_id}")
+    logger.info(f"Cancel callback ({callback_query.data}) received from user {user_id}")
     try:
         if user_id in USER_TASKS:
             USER_TASKS[user_id]['cancel'].set()
             del USER_TASKS[user_id]
-            await callback_query.edit_message_text("❌ Download cancelled by user.")
+            await callback_query.edit_message_text(f"❌ {USER_TASKS[user_id]['type'].capitalize()} cancelled by user.")
+            await asyncio.sleep(2)
+            await callback_query.message.delete()
         elif user_id in BATCHES:
             del BATCHES[user_id]
             await callback_query.edit_message_text("❌ Batch queue cancelled by user.")
+            await asyncio.sleep(2)
+            await callback_query.message.delete()
         else:
-            await callback_query.answer("No active download or batch to cancel.", show_alert=True)
+            await callback_query.answer("No active download/upload or batch to cancel.", show_alert=True)
     except Exception as e:
-        logger.error(f"Error in cancel_download_cb for user {user_id}: {e}")
+        logger.error(f"Error in cancel_callback for user {user_id}: {e}")
 
 # --- File Handling ---
 @app.on_message(filters.document | filters.video | filters.audio)
 async def save_file(client, message: Message):
     user_id = message.from_user.id
     logger.info(f"File received from user {user_id}")
-    # Only queue files if user is in batch mode
     if user_id not in BATCHES:
         try:
             await message.reply_text("Please start batch mode with /batch before sending files, or reply to this file with /create to generate a torrent.", parse_mode=enums.ParseMode.HTML)
@@ -322,7 +509,6 @@ async def save_file(client, message: Message):
             logger.error(f"Error replying to user {user_id} in save_file: {e}")
             return
 
-    # Queue the file (store Message object)
     try:
         batch_list = BATCHES[user_id]
         batch_list.append(message)
@@ -352,16 +538,16 @@ async def create_torrent_cmd(client, message: Message):
         file_path = os.path.join(DOWNLOADS_DIR, file_name or f"file_{user_id}_{int(time.time())}")
         logger.info(f"Checking file for user {user_id}: {file_path}")
 
-        # Download the replied-to file if not already downloaded
         if not os.path.exists(file_path):
             sent = await message.reply_text("Downloading file to create torrent...")
             logger.info(f"Downloading file for user {user_id}: {file_path}")
             downloaded = await download_with_progress(reply, reply, file_path, is_batch=False, user_id=user_id)
             if not downloaded:
                 await sent.edit_text("Failed to download the file.")
+                await asyncio.sleep(2)
+                await sent.delete()
                 logger.warning(f"Failed to download file {file_path} for user {user_id}")
                 return
-            await sent.edit_text("File downloaded! Creating torrent...")
         else:
             sent = await message.reply_text("Creating torrent...")
             logger.info(f"File {file_path} already exists for user {user_id}, creating torrent")
@@ -369,10 +555,14 @@ async def create_torrent_cmd(client, message: Message):
         torrent_path, magnet_uri = create_torrent(file_path, torrent_name=os.path.splitext(file_name)[0])
         if not torrent_path or not magnet_uri:
             await sent.edit_text("Failed to create torrent.")
+            await asyncio.sleep(2)
+            await sent.delete()
             logger.error(f"Failed to create torrent for {file_path}")
             return
         await sent.edit(f"<b>Torrent created!</b>\n\n<code>{magnet_uri}</code>\n\nSending .torrent file...", parse_mode=enums.ParseMode.HTML)
         await message.reply_document(torrent_path, caption=".torrent file")
+        await asyncio.sleep(2)
+        await sent.delete()
         logger.info(f"Torrent sent to user {user_id}: {torrent_path}")
         asyncio.create_task(seed_torrent(torrent_path, file_path))
     except Exception as e:
@@ -426,11 +616,12 @@ async def batch_done(client, message: Message):
         completed_files = 0
         downloaded_paths = []
 
-        # Download all queued files
         sent = await message.reply_text(f"Downloading {total_files} files for batch: <b>{batch_name}</b>...", parse_mode=enums.ParseMode.HTML)
         for index, file_message in enumerate(batch_list, 1):
             if USER_TASKS.get(user_id, {}).get('cancel', asyncio.Event()).is_set():
                 await sent.edit_text("❌ Batch download cancelled.")
+                await asyncio.sleep(2)
+                await sent.delete()
                 logger.info(f"Batch download cancelled for user {user_id}")
                 break
 
@@ -462,21 +653,26 @@ async def batch_done(client, message: Message):
 
         if completed_files == 0:
             await sent.edit_text("❌ No files were downloaded for the batch.")
+            await asyncio.sleep(2)
+            await sent.delete()
             logger.warning(f"No files downloaded for batch {batch_name} for user {user_id}")
             del BATCHES[user_id]
             return
 
-        # Create torrent for downloaded files
         await sent.edit_text(f"Creating batch torrent: <b>{batch_name}</b>...", parse_mode=enums.ParseMode.HTML)
         torrent_path, magnet_uri = create_torrent(folder_path, torrent_name=batch_name)
         if not torrent_path or not magnet_uri:
             await sent.edit_text("Failed to create batch torrent.")
+            await asyncio.sleep(2)
+            await sent.delete()
             logger.error(f"Failed to create batch torrent for {folder_path}")
             del BATCHES[user_id]
             return
 
         await sent.edit(f"<b>Batch torrent created!</b>\n\n<code>{magnet_uri}</code>\n\nSending .torrent file...", parse_mode=enums.ParseMode.HTML)
         await message.reply_document(torrent_path, caption="Batch .torrent file")
+        await asyncio.sleep(2)
+        await sent.delete()
         logger.info(f"Batch torrent sent to user {user_id}: {torrent_path}")
         asyncio.create_task(seed_torrent(torrent_path, folder_path))
         del BATCHES[user_id]
@@ -485,8 +681,65 @@ async def batch_done(client, message: Message):
         logger.error(f"Error in batch_done for user {user_id}: {e}")
         try:
             await message.reply_text("An error occurred while creating the batch torrent.")
+            await asyncio.sleep(2)
+            await sent.delete()
         except Exception as e2:
             logger.error(f"Error replying to user {user_id} in batch_done: {e2}")
+
+# --- Seedr Command ---
+@app.on_message(filters.command("seedr") & filters.reply)
+async def seedr_cmd(client, message: Message):
+    user_id = message.from_user.id
+    logger.info(f"Seedr command received from user {user_id}")
+    reply = message.reply_to_message
+    torrent_input = None
+
+    try:
+        if reply.text and reply.text.startswith("magnet:"):
+            torrent_input = reply.text
+            logger.info(f"Magnet link received for user {user_id}: {torrent_input[:50]}...")
+        elif reply.document and reply.document.file_name.endswith(".torrent"):
+            torrent_path = os.path.join(TORRENTS_DIR, reply.document.file_name)
+            await reply.download(file_name=torrent_path)
+            torrent_input = torrent_path
+            logger.info(f"Torrent file downloaded for user {user_id}: {torrent_path}")
+        else:
+            await message.reply_text("Please reply to a magnet link or a .torrent file with /seedr.", parse_mode=enums.ParseMode.HTML)
+            logger.info(f"User {user_id} did not reply to a valid magnet link or torrent file")
+            return
+
+        save_path = await download_torrent(message, torrent_input, user_id)
+        if not save_path:
+            logger.warning(f"Torrent download failed for user {user_id}")
+            return
+
+        # Handle downloaded files
+        if os.path.isfile(save_path):
+            files = [(save_path, os.path.basename(save_path))]
+        else:
+            files = [(os.path.join(save_path, f), f) for f in os.listdir(save_path) if os.path.isfile(os.path.join(save_path, f))]
+
+        sent = await message.reply_text(f"Uploading {len(files)} file(s)...", parse_mode=enums.ParseMode.HTML)
+        for file_path, file_name in files:
+            is_video = mimetypes.guess_type(file_path)[0].startswith('video') if mimetypes.guess_type(file_path)[0] else False
+            duration = get_file_duration(file_path) if is_video else 0
+            logger.info(f"Uploading file for user {user_id}: {file_path}, is_video: {is_video}, duration: {duration}")
+            success = await upload_with_progress(message, file_path, user_id, is_video=is_video, duration=duration)
+            if not success:
+                logger.warning(f"Failed to upload file {file_path} for user {user_id}")
+                continue
+            asyncio.create_task(delete_file_later(file_path, delay=300))
+
+        await sent.edit_text(f"✅ Uploaded {len(files)} file(s)!")
+        await asyncio.sleep(2)
+        await sent.delete()
+        logger.info(f"Completed uploading {len(files)} file(s) for user {user_id}")
+    except Exception as e:
+        logger.error(f"Error in seedr_cmd for user {user_id}: {e}")
+        try:
+            await message.reply_text("An error occurred while processing the torrent.")
+        except Exception as e2:
+            logger.error(f"Error replying to user {user_id} in seedr_cmd: {e2}")
 
 if __name__ == "__main__":
     logger.info("Starting torrent bot...")
