@@ -25,6 +25,27 @@ DOWNLOADS_DIR = "downloads"
 TORRENTS_DIR = "torrents"
 BATCHES = {}  # Stores user_id: [Message objects]
 USER_TASKS = {}  # Stores user_id: {'type': 'download' or 'upload', 'cancel': Event}
+trackers = [
+    # Nyaa related public tracker
+    "http://nyaa.tracker.wf:7777/announce",
+
+    # Most reliable public trackers
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.stealth.si:80/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "udp://tracker.dler.org:6969/announce",
+    "udp://exodus.desync.com:6969/announce",
+    "udp://tracker.cyberia.is:6969/announce",
+    "udp://tracker.moeking.me:6969/announce",
+    "udp://tracker.bittor.pw:1337/announce",
+    "udp://tracker.uw0.xyz:6969/announce",
+
+    # HTTP trackers (fallback)
+    "http://tracker.opentrackr.org:1337/announce",
+    "http://tracker.openbittorrent.com:80/announce"
+]
+
+
 
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 os.makedirs(TORRENTS_DIR, exist_ok=True)
@@ -314,7 +335,8 @@ def create_torrent(file_path, torrent_name=None):
         fs = lt.file_storage()
         lt.add_files(fs, file_path)
         t = lt.create_torrent(fs)
-        t.add_tracker("udp://tracker.openbittorrent.com:80/announce")
+        for tkr in trackers:
+            t.add_tracker(tkr)
         t.set_creator("Pyrogram Torrent Bot")
         lt.set_piece_hashes(t, os.path.dirname(file_path))
         torrent = t.generate()
@@ -334,22 +356,42 @@ def create_torrent(file_path, torrent_name=None):
 
 async def seed_torrent(torrent_path, file_path):
     logger.info(f"Starting seeding for {torrent_path}")
+
     try:
         ses = lt.session()
         ses.listen_on(6881, 6891)
-        params = {
-            "save_path": os.path.dirname(file_path),
-            "storage_mode": lt.storage_mode_t.storage_mode_sparse,
-        }
+
+        # Enable peer discovery (VERY IMPORTANT)
+        ses.start_dht()
+        ses.start_lsd()
+        ses.start_upnp()
+        ses.start_natpmp()
+
         info = lt.torrent_info(torrent_path)
-        h = ses.add_torrent({'ti': info, 'save_path': params["save_path"]})
+        handle = ses.add_torrent({
+            'ti': info,
+            'save_path': os.path.dirname(file_path)
+        })
+
         logger.info(f"Seeding started for: {file_path}")
-        for i in range(300):  # Seed for 5 minutes
+
+        # Wait until seeding starts properly
+        for _ in range(300):  # 5 minutes
+            s = handle.status()
+
+            logger.info(
+                f"Progress: {s.progress * 100:.2f}% | "
+                f"Peers: {s.num_peers} | "
+                f"Upload: {human_readable_size(s.total_upload)}"
+            )
+
             await asyncio.sleep(1)
-        logger.info(f"Seeding finished for: {file_path}")
+
+        logger.info(f"Seeding finished after 5 minutes")
+
     except Exception as e:
         logger.error(f"Error seeding {torrent_path}: {e}")
-
+        
 # --- Torrent Download (for /seedr) ---
 async def download_torrent(message, torrent_input, user_id):
     logger.info(f"Starting torrent download for user {user_id}")
